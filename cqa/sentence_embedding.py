@@ -1,0 +1,105 @@
+import tensorflow as tf
+
+
+def cnn_encoder(input_sentence,
+                sentence_len,
+                embedding,
+                embedding_size,
+                filter_size=1000,
+                n1gram=2,
+                n2gram=3,
+                use_hidden=True,
+                hidden_size=800,
+                hidden_layer_num=3,
+                name_scope=None,
+                reuse=False):
+
+    batch_size = tf.shape(input_sentence)[0]
+    input_sentence_embbeding = tf.nn.embedding_lookup(embedding, input_sentence)
+    # print 'input_sentence_embbeding:', input_sentence_embbeding
+    '''
+    input_sentence_embbeding: Tensor("embedding_lookup:0", shape=(?, 40, 200), dtype=float32)
+    '''
+    # print 'embedding:', embedding, 'input_sentence:', input_sentence
+    name_scope_prefix = '' if name_scope is None else name_scope
+    with tf.variable_scope(name_scope_prefix, reuse=reuse):
+        with tf.variable_scope("conventional1", reuse=reuse):
+            # bigram
+            n1gram_scope_name = str(n1gram)+"_gram"
+            n2gram_scope_name = str(n2gram)+"_gram"
+            with tf.variable_scope(n1gram_scope_name, reuse=reuse):
+                # print 'input_sentence_embbeding:', input_sentence_embbeding
+                # print 'before input:', (tf.expand_dims(input_sentence_embbeding, axis=3)).shape
+                bigram_conv_q = conv_relu(tf.expand_dims(input_sentence_embbeding, axis=3),
+                                                [n1gram, embedding_size, 1, filter_size],  # embedding_size, default: 200
+                                                [1, 1, embedding_size, 1],
+                                                [filter_size])
+                # print 'after conv:', bigram_conv_q.shape
+                pool_bi_q = tf.nn.max_pool(bigram_conv_q, ksize=[1, sentence_len, 1, 1], strides=[1, sentence_len, 1, 1], padding="SAME")
+                # print 'after pooling:', pool_bi_q.shape
+                '''
+                input_sentence_embbeding: Tensor("embedding_lookup:0", shape=(?, 40, 200), dtype=float32)
+                before input: (?, 40, 200, 1)
+                after conv: (?, 40, 1, 1000)
+                after pooling: (?, 1, 1, 1000)
+                before input: (?, 40, 200, 1)
+                after conv: (?, 40, 1, 1000)
+                after pooling: (?, 1, 1, 1000)
+                '''
+
+            # trigram
+            with tf.variable_scope(n2gram_scope_name, reuse=reuse):
+                trigram_conv_q = conv_relu(tf.expand_dims(input_sentence_embbeding, axis=3),
+                                                [n2gram, embedding_size, 1, filter_size],
+                                                [1, 1, embedding_size, 1],
+                                                [filter_size])
+
+                pool_tri_q = tf.nn.max_pool(trigram_conv_q, ksize=[1, sentence_len, 1, 1], strides=[1, sentence_len, 1, 1], padding="SAME") # less will padding default=40
+
+        cnn_out = tf.reshape(tf.concat([pool_bi_q, pool_tri_q], axis=1), [batch_size, 2 * filter_size], name="conv_pool")
+        embedding = cnn_out
+        if use_hidden and hidden_layer_num > 0:
+            with tf.variable_scope("post_hidden0", reuse=False):
+                post_hidden = fc_tanh(cnn_out, 2 * filter_size, hidden_size)
+            for i in range(hidden_layer_num - 1):
+                with tf.variable_scope("post_hidden%s" % (i + 1), reuse=False):
+                    post_hidden = fc_tanh(post_hidden, hidden_size, hidden_size)
+            embedding = post_hidden
+
+        return embedding
+
+
+def conv_relu(input, kernel_shape, stride, bias_shape):
+    weights = tf.get_variable("W", kernel_shape, initializer=tf.random_normal_initializer()) # kernel_shape= 
+    bias = tf.get_variable("B", bias_shape, initializer=tf.constant_initializer(0.0))
+    # NHWC
+    conv = tf.nn.conv2d(input, weights, strides=stride, padding="SAME")
+    return tf.nn.relu(conv + bias)
+
+
+def fc_tanh(input, input_len, hidden_layer_size):
+    """
+    i-dimensional input fully connected layer
+    :param input:
+    :param input_len:
+    :return:
+    """
+    weights = tf.get_variable("w", [input_len, hidden_layer_size], initializer=tf.random_normal_initializer())
+    bias = tf.get_variable("B", hidden_layer_size, initializer=tf.constant_initializer(0.0))
+
+    return tf.nn.tanh(tf.matmul(input, weights) + bias)
+
+
+def fc_via_conv_tanh(input, input_height, input_width, hidden_layer_size):
+    """
+    two dimensional input fully connected layer
+    :param input:
+    :param kernel_size:
+    :return:
+    """
+    weights = tf.get_variable("W", [input_height, input_width, 1, hidden_layer_size],
+                              initializer=tf.random_normal_initializer())
+    bias = tf.get_variable("B", [hidden_layer_size], initializer=tf.constant_initializer(0.0))
+    # NHWC
+    conv = tf.nn.conv2d(input, weights, strides=[1, input_height, input_width, 1], padding="VALID")
+    return tf.nn.tanh(conv + bias)

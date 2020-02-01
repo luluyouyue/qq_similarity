@@ -1,0 +1,32 @@
+tf.ConfigProto一般用在创建session的时候。用来对session进行参数配置
+
+CONF.gpu_options.allocator_type = 'BFC' 使用bfc 算法分配gpu
+
+
+
+下面代码输出：
+print type(vocab_id), type(vocab_info)  # dict dict
+    i = 0
+    for (key, value) in vocab_id.items():
+        if i<10:
+            i+=1
+            print key, value
+    i = 0
+    for (key, value) in vocab_info.items():
+        if i<10:
+            i+=1
+            print key, value
+平定 37651
+龈沟 45049
+游乐园 23036
+涉 27459
+
+0 <unk>
+1 <s>
+2 </s>
+3 <pad>
+4 ，
+5 的
+
+array和asarray 都是将一个对象转化为数组，但是 asarray是一个引用，修改对象，它也会跟着被修改！
+np.asarray

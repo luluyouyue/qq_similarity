@@ -1,0 +1,188 @@
+import codecs
+import os
+import qa
+import tensorflow as tf
+from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import average_precision_score
+from sklearn.metrics import auc
+
+import numpy as np
+
+import utils
+from cqa.qa import PredictMode
+
+# _DEV_A_PATH = os.path.join(qa.FLAGS.data_dir, "cqa/dev_a")
+_DEV_Q_PATH = os.path.join(qa.FLAGS.data_dir, "cqa/%s" % qa.FLAGS.test_file) # defualt = qq_test_golden.txt.tokenized
+
+
+tokenizer = utils.tokenizer
+default_label_mapper  = lambda x: 1 if int(x) == 3 else 0
+
+
+def full_eval(cqa_model, session, model_dir, eval_output_dir, label_mapper=default_label_mapper):
+    predicted_results, p, r, threshold, averaged_precision_score, area_under_prcurve = pr_of_all_qas(cqa_model, session, model_dir, _DEV_Q_PATH, eval_output_dir, label_mapper)
+    current_step = cqa_model.global_step.eval(session)
+    eval_metric_file_path = os.path.join(eval_output_dir, "eval_metrics")
+    should_print_head = not os.path.exists(eval_metric_file_path)
+
+    eval_metrics_file = tf.gfile.Open(eval_metric_file_path, "ab")
+    if should_print_head:
+        eval_metrics_file.write("%s\t%s\t%s\n" % ("global_step", "averaged_precision_score", "area_under_prcurve"))
+
+    eval_metrics_file.write("%s\t%s\t%s\n" % (current_step, averaged_precision_score, area_under_prcurve))
+    eval_metrics_file.close()
+
+    pr_file = tf.gfile.Open(os.path.join(eval_output_dir, "pr_curve"), "wb")
+    pr_file.write("%s\t%s\t%s\n" % ("threshold", "p", "r"))
+    for _threshold, _p, _r in zip(threshold, p, r):
+        pr_file.write("%s\t%s\t%s\n" % (_threshold, _p, _r))
+    pr_file.close()
+
+
+def pr_of_all_qas(cqa_model, session, model_dir, eval_file, eval_output_dir, label_mapper=default_label_mapper):
+    """
+    caluculate precision recall statics on all q,a pairs
+    :param cqa_model:
+    :param session:
+    :param model_dir:
+    :param eval_file:
+    :param eval_output_dir:
+    :param label_mapper:
+    :return:
+    """
+    print "start evaluating file %s ..." % eval_file
+    cqa_model.create_or_load_model(session, model_dir )
+    predicted_results_file = tf.gfile.Open(os.path.join(eval_output_dir, os.path.basename(eval_file)) + ".predict", "wb")
+    predicted_results = []
+    grounded_results = []
+    # do prediction
+    with (codecs.getreader("utf-8"))(tf.gfile.Open(eval_file, "rb")) as iif:
+        for line in iif:
+            frags = line.strip().split("\t")
+            if len(frags) != 3:
+                print "Illegal line: %s" % line
+            input_question, candidate_question, label = frags
+            actual_label = label_mapper(label)
+            input_question = tokenizer(input_question)
+            candidate_question = tokenizer(candidate_question)
+            predicted_score = np.reshape(cqa_model.predict(session, input_question, candidate_question), -1)[0]
+            predicted_results.append(predicted_score)
+            grounded_results.append(actual_label)
+
+            predicted_results_file.write("%s\t%s\n" % (utils.to_utf8(line.strip()), predicted_score))
+
+    predicted_results_file.close()
+
+    # pr curve
+    p, r, threshold = precision_recall_curve(grounded_results, predicted_results, pos_label=1)
+    averaged_precision_score = average_precision_score(grounded_results, predicted_results)
+    area_under_prcurve = auc(p, r, reorder=True)
+
+    return predicted_results, p, r, threshold, averaged_precision_score, area_under_prcurve
+
+
+def pr_at_k(k, cqa_model, session, model_dir, eval_file, eval_output_dir, label_mapper=default_label_mapper, predictMode=PredictMode.cosine_sim):
+    """
+    for each input question, there are actully a list a candidate questions and corresponding answers. However,
+    in practice we usually only return the top k(usually k = 1) scored candidate questions. So we only care pr
+    of top k  candidate q, a s.
+    :param cqa_model:
+    :param session:
+    :param model_dir:
+    :param eval_file:
+    :param eval_output_dir:
+    :param label_mapper:
+    :return:
+    """
+    print "start evaluating pr at %s for file %s ..." % (k, eval_file)
+    cqa_model.create_or_load_model(session, model_dir)
+    predicted_results, grounded_results = _run_predict(cqa_model, session, eval_file, eval_output_dir, label_mapper, predictMode)
+
+    assert len(predicted_results) == len(grounded_results)
+
+    truncated_predicted_results = []
+    truncated_grounded_results = []
+    for i in xrange(len(predicted_results)):
+        pred = predicted_results[i]
+        ground = grounded_results[i]
+
+        # sort
+        assert len(pred) == len(ground)
+        sort_order = sorted(range(len(pred)), key=lambda x: pred[x], reverse=True)
+        sorted_pred = map(lambda x: pred[x], sort_order)
+        sorted_ground = map(lambda x: ground[x], sort_order)
+
+        # truncate
+        truncated_predicted_results.extend(sorted_pred[:k])
+        truncated_grounded_results.extend(sorted_ground[:k])
+
+    # pr curve
+    p, r, threshold = precision_recall_curve(truncated_grounded_results, truncated_predicted_results, pos_label=1)
+    averaged_precision_score = average_precision_score(truncated_grounded_results, truncated_predicted_results)
+    area_under_prcurve = auc(p, r, reorder=True)
+
+    return truncated_predicted_results, truncated_grounded_results, p, r, threshold, averaged_precision_score, area_under_prcurve
+
+
+def _run_predict(cqa_model, session, eval_file, eval_output_dir, label_mapper=default_label_mapper, predictMode=PredictMode.cosine_sim):
+    predicted_results_file = tf.gfile.Open(os.path.join(eval_output_dir, os.path.basename(eval_file)) + ".predict." + predictMode, "wb")
+
+    predicted_results = []
+    grounded_results = []
+
+    cur_input_questions = None
+    cur_predicted_results = []
+    cur_grounded_results = []
+
+    with (codecs.getreader("utf-8"))(tf.gfile.Open(eval_file, "rb")) as iif:
+        for line in iif:
+            frags = line.strip().split("\t")
+            if len(frags) != 3:
+                print "Illegal line: %s" % line
+            input_question, candidate_question, label = frags
+
+            if input_question != cur_input_questions:
+                predicted_results.append(cur_predicted_results)
+                grounded_results.append(cur_grounded_results)
+                cur_predicted_results = []
+                cur_grounded_results = []
+                cur_input_questions = input_question
+
+            actual_label = label_mapper(label)
+            input_question = tokenizer(input_question)
+            candidate_question = tokenizer(candidate_question)
+            predicted_score = _clip(float(cqa_model.predict(session, input_question, candidate_question, predictMode)))
+            cur_predicted_results.append(predicted_score)
+            cur_grounded_results.append(actual_label)
+
+            predicted_results_file.write("%s\t%s\n" % (utils.to_utf8(line.strip()), predicted_score))
+
+    if len(cur_predicted_results) > 0:
+        predicted_results.append(cur_predicted_results)
+        grounded_results.append(cur_grounded_results)
+    predicted_results_file.close()
+
+    return predicted_results, grounded_results
+
+def _clip(v):
+    if isinstance(v, float):
+        if v > 1.0:
+            return 1.0
+        elif v < 0.0:
+            return 0.0
+        else:
+            return v
+    elif isinstance(v, list):
+        return map(lambda x: _clip(x), v)
+    else:
+        return v
+
+if __name__ == "__main__":
+    pred = [0.9477744102478027, 0.9045997858047485, 0.9196789860725403, 0.8538294434547424, 0.9682987332344055, 0.9745415449142456, 0.9293452501296997, 0.9293733239173889, 0.9671770334243774, 0.9494284987449646, 0.8339932560920715, 0.9639967083930969, 0.9735727310180664, 0.8126952648162842, 0.9788331985473633, 0.9274370670318604, 0.9838433861732483, 0.912398636341095, 0.9210530519485474, 0.9324236512184143, 0.982698917388916, 0.968151867389679, 0.9850382208824158, 0.9449384808540344, 0.9216808080673218, 0.9843560457229614, 0.7414562702178955, 0.9858154654502869, 0.9686592221260071, 0.9371592998504639, 0.9226190447807312, 0.9764229655265808, 0.895519495010376, 0.9497609734535217, 0.973037838935852, 0.7917407751083374, 0.9053370356559753, 0.9526749849319458, 0.9642571210861206, 0.9237649440765381, 0.9726700782775879, 0.9919069409370422, 0.986484169960022, 0.9990036487579346, 0.9274196624755859, 0.9643951654434204, 0.9172346591949463, 0.9472439885139465, 0.991691529750824, 0.9760001301765442, 0.9862025380134583, 0.965266764163971, 0.9991247057914734, 0.9147385358810425, 0.9779731035232544, 0.9547569155693054, 0.9369902610778809, 0.9180545210838318, 0.989025890827179, 0.9629669785499573, 0.9416888356208801, 0.9999909400939941, 0.8928973078727722, 0.8994626402854919, 0.9387253522872925, 0.8819660544395447, 0.9700253009796143, 0.903769314289093, 0.9767102599143982, 0.9826022982597351, 0.9392815828323364, 0.9537606835365295, 0.9608243703842163, 0.8294181823730469, 0.9098048806190491, 0.9937273859977722, 0.9354158639907837, 0.9988724589347839, 0.9891526103019714, 0.8647879362106323, 0.9479280710220337, 0.9744873046875, 0.9653798341751099, 0.8804258108139038, 0.9237164855003357, 0.9347343444824219, 0.9508897662162781, 0.8707025051116943, 0.8824106454849243, 0.961094856262207, 0.9196279644966125, 0.9919304251670837, 0.9709498882293701, 0.9426118731498718, 0.9927896857261658, 0.8397526144981384, 0.9580873847007751, 0.9845976829528809, 0.9848725199699402, 0.9039790034294128, 0.9190042018890381, 0.9860800504684448, 0.9316796064376831, 0.9791642427444458, 0.9394716620445251, 0.9695305824279785, 0.952328622341156, 0.9925534725189209, 0.9671639204025269, 0.9832436442375183, 0.9875445365905762, 0.995795488357544, 0.9660083055496216, 0.9171079397201538, 0.9588253498077393, 0.9027374386787415, 0.8555629253387451, 0.9241427183151245, 0.9584574103355408, 0.9886071085929871, 0.9708916544914246, 0.9159697890281677, 0.9754741191864014, 0.9681608080863953, 0.8766540288925171, 0.9421401023864746, 0.8825379610061646, 0.8861408233642578, 0.9790840148925781, 0.9586967825889587, 0.783258855342865, 0.9880392551422119, 0.9989560842514038, 0.9020209312438965, 0.8817168474197388, 0.9296119213104248, 0.9561302065849304, 0.917277991771698, 0.9560288786888123, 0.9160981774330139, 0.8580130338668823, 0.9904380440711975, 0.997209370136261, 0.9881511330604553, 0.8824228644371033, 0.9918542504310608, 0.9771503210067749, 0.958804190158844, 0.8688010573387146, 0.990100085735321, 0.929568350315094, 0.8131338953971863, 0.9402781128883362, 0.8871400356292725, 0.9745832085609436, 0.9240743517875671, 0.9264642596244812, 0.9482188820838928, 0.9817128777503967, 0.9557580947875977, 0.9299262762069702, 0.9486595988273621, 0.9707093834877014, 0.8891359567642212, 0.9064896702766418, 0.8559069633483887, 0.885649561882019, 0.8868519067764282, 0.9893547892570496, 0.9676084518432617]
+    ground = [1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1]
+
+    assert len(pred) == len(ground)
+    p, r, t = precision_recall_curve(ground, pred, pos_label=1)
+    print len(p), len(r), len(t)
+    for i in xrange(len(p) - 1):
+        print "%s\t%s\t%s" % (p[i], r[i], t[i])

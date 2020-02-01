@@ -1,0 +1,171 @@
+
+
+
+import codecs
+import os
+
+import tensorflow as tf
+import numpy as np
+import re
+
+UNK = "<unk>"
+SOS = "<s>"
+EOS = "</s>"
+PAD = "<pad>"
+UNK_ID = 0
+
+print_out = print
+
+
+def tokenizer(line):
+    return re.split(r"\s+", line.strip())
+
+
+def _create_pretrained_emb_from_txt(
+        vocab_file, embed_file, num_trainable_tokens=3, dtype=tf.float32,
+        scope=None):
+    """Load pretrain embeding from embed_file, and return an embedding matrix.
+    Args:
+      embed_file: Path to a Glove formated embedding txt file.
+      num_trainable_tokens: Make the first n tokens in the vocab file as trainable
+        variables. Default is 3, which is "<unk>", "<s>" and "</s>".
+    """
+    vocab, _ = _load_vocab(vocab_file)
+    trainable_tokens = vocab[:num_trainable_tokens]
+
+    print_out('# Using pretrained embedding: %s.' % embed_file)
+    print_out('  with trainable tokens: ')
+
+    emb_dict, emb_size = load_embed_txt(embed_file)
+    for token in trainable_tokens:
+        print_out('    %s' % token)
+        if token not in emb_dict:
+            emb_dict[token] = [0.0] * emb_size
+
+    emb_dict[PAD] = [0.0] * emb_size
+
+    emb_mat = np.array(
+        [emb_dict[token] for token in vocab], dtype=dtype.as_numpy_dtype())
+    emb_mat = tf.constant(emb_mat)
+    emb_mat_const = tf.slice(emb_mat, [num_trainable_tokens, 0], [-1, -1])
+    with tf.variable_scope(scope or "pretrain_embeddings", dtype=dtype) as scope:
+        emb_mat_var = tf.get_variable(
+            "emb_mat_var", [num_trainable_tokens, emb_size])
+    return tf.concat([emb_mat_var, emb_mat_const], 0)
+
+
+def _load_vocab(vocab_file):
+    vocab = []
+    with codecs.getreader("utf-8")(tf.gfile.GFile(vocab_file, "rb")) as f:
+        vocab_size = 0
+        for word in f:
+            vocab_size += 1
+            vocab.append(word.strip())
+    return vocab, vocab_size
+
+
+def load_vocab_details(vocab_file):
+    vocab_id = {}
+    vocab_info = {}
+    with codecs.getreader("utf-8")(tf.gfile.GFile(vocab_file, "rb")) as f:
+        vocab_size = 0
+        for word in f:
+            vocab_id[word.strip()] = vocab_size
+            vocab_info[vocab_size] = word.strip()
+            vocab_size += 1
+    assert len(vocab_info) == len(vocab_id) == vocab_size
+    return vocab_id, vocab_info,  vocab_size
+
+
+def check_vocab(vocab_file, out_dir, check_special_token=True, sos=None,
+                eos=None, unk=None):
+    """Check if vocab_file doesn't exist, create from corpus_file."""
+    if tf.gfile.Exists(vocab_file):
+        print_out("# Vocab file %s exists" % vocab_file)
+        vocab, vocab_size = _load_vocab(vocab_file)
+        if check_special_token:
+            # Verify if the vocab starts with unk, sos, eos
+            # If not, prepend those tokens & generate a new vocab file
+            if not unk: unk = UNK
+            if not sos: sos = SOS
+            if not eos: eos = EOS
+            assert len(vocab) >= 3
+            if vocab[0] != unk or vocab[1] != sos or vocab[2] != eos:
+                print_out("The first 4 vocab words [%s, %s, %s]"
+                                " are not [%s, %s, %s]" %
+                                (vocab[0], vocab[1], vocab[2], unk, sos, eos))
+                vocab = [unk, sos, eos] + vocab
+                vocab_size += 3
+                new_vocab_file = os.path.join(out_dir, os.path.basename(vocab_file))
+                with codecs.getwriter("utf-8")(
+                        tf.gfile.GFile(new_vocab_file, "wb")) as f:
+                    for word in vocab:
+                        f.write("%s\n" % word)
+                vocab_file = new_vocab_file
+    else:
+        raise ValueError("vocab_file '%s' does not exist." % vocab_file)
+
+    vocab_size = len(vocab)
+    return vocab_size, vocab_file
+
+
+def load_embed_txt(embed_file):
+    """Load embed_file into a python dictionary.
+    Note: the embed_file should be a Glove formated txt file. Assuming
+    embed_size=5, for example:
+    the -0.071549 0.093459 0.023738 -0.090339 0.056123
+    to 0.57346 0.5417 -0.23477 -0.3624 0.4037
+    and 0.20327 0.47348 0.050877 0.002103 0.060547
+    Args:
+      embed_file: file path to the embedding file.
+    Returns:
+      a dictionary that maps word to vector, and the size of embedding dimensions.
+    """
+    emb_dict = dict()
+    emb_size = None
+    with codecs.getreader("utf-8")(tf.gfile.GFile(embed_file, 'rb')) as f:
+        for line in f:
+            tokens = line.strip().split(" ")
+            word = tokens[0]
+            vec = list(map(float, tokens[1:]))
+            emb_dict[word] = vec
+            if emb_size:
+                assert emb_size == len(vec), "All embedding size should be same."
+            else:
+                emb_size = len(vec)
+    return emb_dict, emb_size
+
+
+def to_unicode(o):
+    if isinstance(o, str):
+        return o
+    return o
+
+
+def to_utf8(o):
+    if isinstance(o, str):
+        return o.encode("utf8")
+    return o
+
+
+def strip_multiple_spaces(that_str):
+    import regex
+    unistr = to_unicode(that_str)
+    return regex.sub(r'\s+', ' ', unistr)
+
+
+def str2bool(v):
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise ValueError('Boolean value expected.')
+
+
+# To-do
+def print_argparse_values(flags):
+    pass
+
+# def get_tf_version_as_float():
+#     tf.__version__
